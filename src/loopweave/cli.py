@@ -1,0 +1,283 @@
+"""Command line utilities for the local LoopWeave server."""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from pathlib import Path
+
+import typer
+import uvicorn
+
+from .config import AppConfig, load_yaml_config
+from .exceptions import ConfigMismatchError
+from .persistence import (
+    flush_all_data,
+    get_current_namespace,
+    get_redis_store,
+    validate_config_signature,
+)
+from .runtime._constants import get_address_file
+from .server import create_root_app
+from .telemetry import init_telemetry
+from .telemetry.metrics import ResourceMetricsCollector
+
+
+app = typer.Typer(help="LoopWeave - Tenant-unified Fine-Tuning Server.", no_args_is_help=True)
+clear_app = typer.Typer(help="Clear data commands.", no_args_is_help=True)
+app.add_typer(clear_app, name="clear")
+
+
+# Required for Typer to recognize subcommands when using no_args_is_help=True
+@app.callback()
+def callback() -> None:
+    """LoopWeave - Tenant-unified Fine-Tuning Server."""
+
+
+# Default paths based on LOOPWEAVE_HOME
+_LOOPWEAVE_HOME = Path(os.environ.get("LOOPWEAVE_HOME", Path.home() / ".loopweave"))
+_DEFAULT_CONFIG_PATH = _LOOPWEAVE_HOME / "configs" / "loopweave_config.yaml"
+_DEFAULT_CHECKPOINT_DIR = _LOOPWEAVE_HOME / "checkpoints"
+
+_HOST_OPTION = typer.Option("127.0.0.1", "--host", help="Interface to bind", envvar="LOOPWEAVE_HOST")
+_PORT_OPTION = typer.Option(10610, "--port", "-p", help="Port to bind", envvar="LOOPWEAVE_PORT")
+_LOG_LEVEL_OPTION = typer.Option(
+    "info", "--log-level", help="Uvicorn log level", envvar="LOOPWEAVE_LOG_LEVEL"
+)
+_RELOAD_OPTION = typer.Option(False, "--reload", help="Enable auto-reload (development only)")
+_CONFIG_OPTION = typer.Option(
+    None,
+    "--config",
+    "-c",
+    help=f"Path to a LoopWeave configuration file (YAML). Defaults to {_DEFAULT_CONFIG_PATH}",
+    envvar="LOOPWEAVE_CONFIG",
+)
+_CHECKPOINT_DIR_OPTION = typer.Option(
+    None,
+    "--checkpoint-dir",
+    help=f"Override checkpoint_dir from config file. Defaults to {_DEFAULT_CHECKPOINT_DIR}",
+    envvar="LOOPWEAVE_CHECKPOINT_DIR",
+)
+
+
+def _resolve_config_path(config_path: Path | None) -> Path:
+    """Resolve the config path, falling back to default if not provided."""
+    if config_path is not None:
+        return config_path
+    if _DEFAULT_CONFIG_PATH.exists():
+        return _DEFAULT_CONFIG_PATH
+    raise typer.BadParameter(
+        f"Configuration file must be provided via --config or LOOPWEAVE_CONFIG, "
+        f"or create a default config at {_DEFAULT_CONFIG_PATH}"
+    )
+
+
+def _build_config(
+    config_path: Path | None,
+    checkpoint_dir: Path | None,
+) -> AppConfig:
+    resolved_config_path = _resolve_config_path(config_path)
+    config = load_yaml_config(resolved_config_path)
+    # Apply checkpoint_dir override, or use default if not in config
+    if checkpoint_dir is not None:
+        config.checkpoint_dir = checkpoint_dir.expanduser()
+    elif config.checkpoint_dir is None:
+        config.checkpoint_dir = _DEFAULT_CHECKPOINT_DIR
+    # Guarantee checkpoint_dir is set after resolution
+    assert config.checkpoint_dir is not None, "checkpoint_dir must be set after config resolution"
+    config.ensure_directories()
+    return config
+
+
+_FORCE_OPTION = typer.Option(
+    False,
+    "--force",
+    "-f",
+    help="Skip confirmation prompts when clearing persistence data.",
+)
+
+
+@clear_app.command(name="persistence")
+def clear_persistence(
+    config_path: Path | None = _CONFIG_OPTION,
+    force: bool = _FORCE_OPTION,
+) -> None:
+    """Clear all persistence data and start fresh.
+
+    This command clears all existing persistence data in the configured namespace.
+    Use this when the configuration has changed and you want to discard old data.
+    """
+    # Build config to get persistence settings
+    try:
+        resolved_config_path = _resolve_config_path(config_path)
+        config = load_yaml_config(resolved_config_path)
+    except typer.BadParameter as e:
+        typer.secho(f"Error: {e}", fg=typer.colors.RED)
+        raise typer.Exit(1) from e
+
+    if not config.persistence.enabled:
+        typer.secho(
+            "Persistence is disabled in the configuration. Nothing to clear.",
+            fg=typer.colors.YELLOW,
+        )
+        raise typer.Exit(0)
+
+    # Configure the store
+    store = get_redis_store()
+    store.configure(config.persistence)
+    namespace = get_current_namespace()
+
+    if not force:
+        typer.secho(
+            "\n🚨🚨🚨 CRITICAL WARNING 🚨🚨🚨\n",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        typer.secho(
+            "This command will PERMANENTLY DELETE ALL persistence data!\n",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        typer.secho(
+            f"📦 Target namespace: '{namespace}'\n",
+            fg=typer.colors.YELLOW,
+            bold=True,
+        )
+        typer.echo(
+            f"This IRREVERSIBLE action will destroy ALL data in namespace '{namespace}':\n"
+            "  ❌ All saved sessions\n"
+            "  ❌ All training run records and checkpoint metadata (NOT local checkpoint files)\n"
+            "  ❌ All future records\n"
+            "  ❌ All sampling session records\n"
+            "  ❌ Configuration signature\n"
+            "\n"
+            "⚠️  The server will start fresh with NO previous state.\n"
+            "⚠️  This action CANNOT be undone!\n"
+            "⚠️  Local checkpoint files on disk are NOT affected.\n"
+            f"⚠️  Only data in namespace '{namespace}' will be affected.\n"
+        )
+        confirmed = typer.confirm(
+            f"Do you REALLY want to delete all data in namespace '{namespace}'?",
+            default=False,
+        )
+        if not confirmed:
+            typer.echo("Aborted. No data was cleared.")
+            raise typer.Exit(0)
+
+    deleted_count, cleared_namespace = flush_all_data()
+    typer.secho(
+        f"✅ Cleared {deleted_count} keys from namespace '{cleared_namespace}'.",
+        fg=typer.colors.GREEN,
+    )
+    typer.echo("Persistence data has been cleared. You can now start the server fresh.")
+
+
+def _validate_persistence_config(config: AppConfig) -> None:
+    """Validate that persistence config matches stored config.
+
+    If config mismatch is detected, exits with an error message.
+    """
+    if not config.persistence.enabled:
+        return
+
+    # Configure the Redis store first
+    store = get_redis_store()
+    store.configure(config.persistence)
+
+    try:
+        validate_config_signature(config)
+    except ConfigMismatchError as e:
+        typer.secho(
+            "\n 🚫 FATAL ERROR: Configuration Mismatch Detected 🚫",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        typer.echo(f"\n{e}\n")
+        raise typer.Exit(1) from e
+
+
+def _init_telemetry(config: AppConfig, log_level: str) -> None:
+    """Initialize OpenTelemetry if enabled."""
+    # Configure root logger level to ensure logs flow to OTel
+    numeric_level = getattr(logging, log_level.upper(), logging.INFO)
+
+    if not config.telemetry.enabled:
+        logging.basicConfig(level=numeric_level)
+        return
+
+    init_telemetry(config.telemetry)
+    # Start resource metrics collection
+    ResourceMetricsCollector.start(str(config.checkpoint_dir))
+
+
+@app.command()
+def launch(
+    host: str = _HOST_OPTION,
+    port: int = _PORT_OPTION,
+    log_level: str = _LOG_LEVEL_OPTION,
+    reload: bool = _RELOAD_OPTION,
+    config_path: Path | None = _CONFIG_OPTION,
+    checkpoint_dir: Path | None = _CHECKPOINT_DIR_OPTION,
+) -> None:
+    """Launch the LoopWeave server."""
+    app_config = _build_config(config_path, checkpoint_dir)
+
+    # Validate persistence configuration before starting
+    _validate_persistence_config(app_config)
+
+    # Set environment variables required by the FlexBackend optimal path.
+    # These are safe defaults; users can still override them explicitly.
+    os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    # Initialize telemetry before starting the server
+    _init_telemetry(app_config, log_level)
+
+    logging.getLogger("loopweave").info("Server starting on %s:%s", host, port)
+
+    # Write address file so embedded mode / other processes can discover this server
+    _write_address_file(host, port)
+
+    try:
+        uvicorn.run(
+            create_root_app(app_config),
+            host=host,
+            port=port,
+            log_level=log_level,
+            reload=reload,
+        )
+    finally:
+        _remove_address_file(host, port)
+
+
+def _write_address_file(host: str, port: int) -> None:
+    """Write server address to the discovery file."""
+    address_file = get_address_file()
+    address = f"http://{host}:{port}"
+    try:
+        address_file.parent.mkdir(parents=True, exist_ok=True)
+        address_file.write_text(address)
+    except OSError:
+        pass
+
+
+def _remove_address_file(host: str, port: int) -> None:
+    """Remove address file if it points to this server."""
+    address_file = get_address_file()
+    try:
+        if address_file.exists():
+            content = address_file.read_text().strip()
+            if content == f"http://{host}:{port}":
+                address_file.unlink()
+    except OSError:
+        pass
+
+
+def main() -> None:
+    app(prog_name="loopweave")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,19 @@
+{
+  "source_pdf": "sampling_training_ratio_range.pdf",
+  "sha256": "89905b5cd535b083db233d03c3c053bb1fac5ebf64d39e5c12625467d257e787",
+  "kind": "Recovered displayed PDF geometry; not raw measurements",
+  "groups": {
+    "Personal": {
+      "min": 3.4276958964512105,
+      "max": 19.272063400544617,
+      "mean": 9.107669000169464,
+      "median": 6.921669673405763
+    },
+    "Group": {
+      "min": 2.5674845940777833,
+      "max": 19.475901297611728,
+      "mean": 9.308128869250297,
+      "median": 6.970651375369159
+    }
+  }
+}

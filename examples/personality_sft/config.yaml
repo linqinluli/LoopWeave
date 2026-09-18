@@ -1,0 +1,49 @@
+# Quick-start LoopWeave config for the personality SFT example.
+#
+# Run a server with this, then train against it:
+#   Local:  loopweave launch --host 0.0.0.0 --port 10610 --config examples/personality_sft/config.yaml
+#   Modal:  python deploy/modal/launch.py --config examples/personality_sft/config.yaml --foreground
+#           (infra comes from the `modal:` section below — no extra flags needed)
+#   Train:  python examples/personality_sft/train.py --base-url <url> --api-key <your-tml-key>
+#
+# FIRST: replace the placeholder API key below with a strong one:
+#   python -c "import secrets; print('tml-' + secrets.token_urlsafe(24))"
+
+checkpoint_dir: ~/.cache/loopweave/checkpoints   # (on Modal, launch.py pins this to a Volume automatically)
+model_owner: local-user
+
+supported_models:
+  - model_name: Qwen/Qwen3-1.7B            # small + cheap; clear Yoda voice in ~60 steps on an L4
+    model_path: Qwen/Qwen3-1.7B            # HF id (downloaded on first launch) or a local path
+    max_model_len: 4096
+    tensor_parallel_size: 1
+    colocate: true                         # single GPU: training + vLLM share it
+    sampling_memory_fraction: 0.3
+    max_lora_rank: 16
+    max_loras: 2
+    # For the bigger Qwen/Qwen3-4B: change both names above and set modal.gpu to H100 (or A100-80GB).
+
+authorized_users:
+  tml-CHANGE-ME: local-user                # MUST start with "tml-" (Tinker SDK requirement)
+
+persistence:
+  mode: DISABLE
+
+telemetry:
+  enabled: false
+
+# Modal infra for deploy/modal/launch.py (LoopWeave ignores this; it's stripped before the server sees it):
+modal:
+  gpu: L4
+  name: personality-sft
+  proxy_auth: false
+  min_containers: 0
+
+# Lambda Cloud infra for deploy/lambda/launch.py (also stripped before the server sees it).
+# Uncomment to use; auto-picks the cheapest available a10 by default.
+# lambda:
+#   gpu: a10                 # family hint for auto-pick; or pin instance_type: gpu_1x_a100_sxm4
+#   name: personality-sft
+#   # region: us-east-1      # default: auto (a region with capacity)
+#   # ssh_key: my-key        # default: the account's sole registered key
+#   # filesystem: loopweave       # Lambda persistent FS for durable checkpoints (else ephemeral root disk)

@@ -1,0 +1,884 @@
+"""FastAPI application exposing a local-compatible Tinker API."""
+
+from __future__ import annotations
+
+import json
+import logging
+import time
+from contextlib import asynccontextmanager
+from datetime import timezone
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, cast
+
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.responses import Response
+from fastapi.security import APIKeyHeader
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from pydantic import BaseModel
+from tinker import types
+
+
+try:
+    from tinker.types._pydantic_types.forward_backward_request import ForwardBackwardRequest
+    from tinker.types._pydantic_types.forward_request import ForwardRequest
+
+except ModuleNotFoundError:
+    from tinker.types import ForwardBackwardRequest, ForwardRequest
+
+from .auth import User
+from .compat import maybe_serialize_payload, serialize_sample_response_proto
+from .config import AppConfig
+from .exceptions import ServerException, LoopWeaveException
+from .oai import create_oai_router
+from .persistence import get_redis_store, save_config_signature
+from .state import ServerState
+from .telemetry import shutdown_telemetry
+
+
+logger = logging.getLogger(__name__)
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def _dump_evaluation_metrics(server_state: ServerState) -> None:
+    """Persist server-side evaluation metrics next to the checkpoint dir."""
+    snapshot = server_state.evaluation_snapshot()
+    if not snapshot:
+        return
+    snapshot["dumped_at"] = time.time()
+    checkpoint_dir = server_state.config.checkpoint_dir
+    out_path = (checkpoint_dir or Path(".")) / "loopweave_eval_metrics.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(snapshot, f, indent=2, default=str)
+    logger.info("Evaluation metrics dumped to %s", out_path)
+
+
+async def _get_user(
+    request: Request,
+    api_key: str = Depends(api_key_header),
+) -> User:
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key",
+        )
+    user = request.app.state.server_state.get_user(api_key)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API key",
+        )
+    return user
+
+
+class WeightsInfoBody(BaseModel):
+    tinker_path: str
+
+
+def _normalize_checkpoint_id(raw: str) -> str:
+    if "/" not in raw:
+        return raw
+    prefix, remainder = raw.split("/", 1)
+    if prefix not in {"weights", "sampler_weights"} or not remainder:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid checkpoint reference",
+        )
+    return remainder
+
+
+def _get_state(request: Request) -> ServerState:
+    state = getattr(request.app.state, "server_state", None)
+    if state is None:
+        raise RuntimeError("Server state has not been initialized")
+    return state
+
+
+def _instrument_fastapi(app: FastAPI) -> None:
+    """Instrument FastAPI app with OpenTelemetry."""
+    FastAPIInstrumentor.instrument_app(app)
+    logger.debug("FastAPI instrumentation enabled")
+
+
+def create_root_app(config: AppConfig | None = None) -> FastAPI:
+    resolved_config = config or AppConfig()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Create shared httpx client for OpenAI API proxying
+        app.state.httpx_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0))
+        try:
+            await app.state.server_state.async_init()
+            logger.info("Server initialized successfully")
+
+            # After successful init/restore, save the current config signature
+            if resolved_config.persistence.enabled:
+                save_config_signature(resolved_config)
+                logger.debug("Config signature saved after successful initialization")
+
+            yield
+        finally:
+            logger.info("Server shutting down")
+            try:
+                _dump_evaluation_metrics(app.state.server_state)
+            except Exception:
+                logger.exception("Failed to dump evaluation metrics")
+            await app.state.httpx_client.aclose()
+            await app.state.server_state.future_store.shutdown()
+            store = get_redis_store()
+            if store.is_enabled:
+                store.close()
+            shutdown_telemetry()
+
+    def require_user_dependency(route):
+        if not any(dep.dependency == _get_user for dep in getattr(route, "dependencies", [])):
+            route.dependencies = getattr(route, "dependencies", []) + [Depends(_get_user)]
+        return route
+
+    if resolved_config.persistence.enabled:
+        store = get_redis_store()
+        store.configure(resolved_config.persistence)
+
+    app = FastAPI(
+        title="LoopWeave",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+    app.state.server_state = ServerState(resolved_config)
+
+    # Mount OpenAI-compatible API router
+    oai_router = create_oai_router()
+    app.include_router(oai_router)
+
+    # Instrument FastAPI with OpenTelemetry if enabled
+    if resolved_config.telemetry.enabled:
+        _instrument_fastapi(app)
+
+    @app.get("/api/v1/healthz", response_model=types.HealthResponse)
+    async def healthz() -> types.HealthResponse:
+        return types.HealthResponse(status="ok")
+
+    @app.get("/api/v1/evaluation_metrics")
+    async def evaluation_metrics(state: ServerState = Depends(_get_state)):
+        """Server-side evaluation metrics (scheduler/corrector/pipeline stats)."""
+        return state.evaluation_snapshot()
+
+    @app.get(
+        "/api/v1/get_server_capabilities",
+        response_model=types.GetServerCapabilitiesResponse,
+    )
+    async def get_server_capabilities(
+        state: ServerState = Depends(_get_state),
+    ) -> types.GetServerCapabilitiesResponse:
+        return types.GetServerCapabilitiesResponse(supported_models=state.build_supported_models())
+
+    @app.post(
+        "/api/v1/create_session",
+        response_model=types.CreateSessionResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_session(
+        request: types.CreateSessionRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.CreateSessionResponse:
+        record = state.create_session(request, user)
+        return types.CreateSessionResponse(session_id=record.session_id)
+
+    @app.post(
+        "/api/v1/session_heartbeat",
+        response_model=types.SessionHeartbeatResponse,
+    )
+    async def session_heartbeat(
+        request: types.SessionHeartbeatRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.SessionHeartbeatResponse:
+        state.heartbeat(request.session_id, user_id=user.user_id)
+        return types.SessionHeartbeatResponse()
+
+    @app.post(
+        "/api/v1/create_sampling_session",
+        response_model=types.CreateSamplingSessionResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_sampling_session(
+        request: types.CreateSamplingSessionRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.CreateSamplingSessionResponse:
+        try:
+            sampling_session_id = await state.create_sampling_session(
+                session_id=request.session_id,
+                user_id=user.user_id,
+                base_model=request.base_model,
+                model_path=request.model_path,
+                session_seq_id=request.sampling_session_seq_id,
+            )
+        except LoopWeaveException as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=f"Failed to create sampling session: {exc.detail}",
+            ) from exc
+        except Exception as exc:  # pylint: disable=broad-except
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to create sampling session: {str(exc)}",
+            ) from exc
+        return types.CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
+
+    @app.post(
+        "/api/v1/create_model",
+        response_model=types.UntypedAPIFuture,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def create_model(
+        request: types.CreateModelRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.UntypedAPIFuture:
+        if request.lora_config is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail="Missing LoRA config"
+            )
+
+        async def _operation() -> types.CreateModelResponse:
+            training_record = await state.create_model(
+                session_id=request.session_id,
+                base_model=request.base_model,
+                lora_config=request.lora_config,
+                model_owner=user.user_id,
+                user_metadata=request.user_metadata,
+            )
+            return types.CreateModelResponse(model_id=training_record.training_run_id)
+
+        # Enqueue rather than awaiting inline: under Serial-Async a create can wait
+        # for the previous tenant's entire slice, and holding the HTTP request open
+        # that long makes the client give up before the ready future is returned.
+        # As an enqueued future the client polls retrieve_future, which tolerates
+        # the wait exactly like forward/optim/sample do.
+        return await _queue_future(
+            _operation,
+            state,
+            user_id=user.user_id,
+            operation_type="create_model",
+            operation_args={
+                "session_id": request.session_id,
+                "base_model": request.base_model,
+                "user_id": user.user_id,
+            },
+        )
+
+    @app.post(
+        "/api/v1/get_info",
+        response_model=types.GetInfoResponse,
+    )
+    async def get_info(
+        request: types.GetInfoRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.GetInfoResponse:
+        return state.get_model_info(request.model_id, user_id=user.user_id)
+
+    @app.post(
+        "/api/v1/unload_model",
+        response_model=types.UntypedAPIFuture,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def unload_model(
+        request: types.UnloadModelRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.UntypedAPIFuture:
+        try:
+            await state.unload_model(request.model_id, user_id=user.user_id)
+        except LoopWeaveException as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=f"Failed to unload model: {exc.detail}",
+            ) from exc
+        except Exception as exc:  # pylint: disable=broad-except
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to unload model: {str(exc)}",
+            ) from exc
+        response = types.UnloadModelResponse(model_id=request.model_id)
+        return await state.future_store.create_ready_future(
+            response, model_id=request.model_id, user_id=user.user_id
+        )
+
+    async def _queue_future(
+        operation: Callable[[], Any],
+        state: ServerState,
+        user_id: str,
+        *,
+        model_id: str | None = None,
+        operation_type: str | None = None,
+        operation_args: dict[str, Any] | None = None,
+    ) -> types.UntypedAPIFuture:
+        return await state.future_store.enqueue(
+            operation,
+            model_id=model_id,
+            user_id=user_id,
+            operation_type=operation_type,  # type: ignore[arg-type]
+            operation_args=operation_args,
+        )
+
+    @app.post(
+        "/api/v1/forward",
+        response_model=types.UntypedAPIFuture,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def forward(
+        request: ForwardRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.UntypedAPIFuture:
+        inp = request.forward_input
+        data = cast(list[types.Datum], inp.data)
+
+        async def _operation() -> types.ForwardBackwardOutput:
+            return await state.run_forward(
+                request.model_id,
+                user.user_id,
+                data,
+                inp.loss_fn,
+                inp.loss_fn_config,
+                request.seq_id,
+                backward=False,
+            )
+
+        return await _queue_future(
+            _operation,
+            state,
+            model_id=request.model_id,
+            user_id=user.user_id,
+            operation_type="forward",
+            operation_args={
+                "model_id": request.model_id,
+                "user_id": user.user_id,
+                "data": data,
+                "loss_fn": inp.loss_fn,
+                "loss_fn_config": inp.loss_fn_config,
+                "seq_id": request.seq_id,
+                "backward": False,
+            },
+        )
+
+    @app.post(
+        "/api/v1/forward_backward",
+        response_model=types.UntypedAPIFuture,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def forward_backward(
+        request: ForwardBackwardRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.UntypedAPIFuture:
+        inp = request.forward_backward_input
+        data = cast(list[types.Datum], inp.data)
+
+        async def _operation() -> types.ForwardBackwardOutput:
+            return await state.run_forward(
+                request.model_id,
+                user.user_id,
+                data,
+                inp.loss_fn,
+                inp.loss_fn_config,
+                request.seq_id,
+                backward=True,
+            )
+
+        return await _queue_future(
+            _operation,
+            state,
+            model_id=request.model_id,
+            user_id=user.user_id,
+            operation_type="forward_backward",
+            operation_args={
+                "model_id": request.model_id,
+                "user_id": user.user_id,
+                "data": inp.data,
+                "loss_fn": inp.loss_fn,
+                "loss_fn_config": inp.loss_fn_config,
+                "seq_id": request.seq_id,
+                "backward": True,
+            },
+        )
+
+    @app.post(
+        "/api/v1/optim_step",
+        response_model=types.UntypedAPIFuture,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def optim_step(
+        request: types.OptimStepRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.UntypedAPIFuture:
+        async def _operation() -> types.OptimStepResponse:
+            return await state.run_optim_step(
+                request.model_id,
+                user.user_id,
+                request.adam_params,
+                request.seq_id,
+            )
+
+        return await _queue_future(
+            _operation,
+            state,
+            model_id=request.model_id,
+            user_id=user.user_id,
+            operation_type="optim_step",
+            operation_args={
+                "model_id": request.model_id,
+                "user_id": user.user_id,
+                "params": request.adam_params,
+                "seq_id": request.seq_id,
+            },
+        )
+
+    @app.post(
+        "/api/v1/save_weights",
+        response_model=types.UntypedAPIFuture,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def save_weights(
+        request: types.SaveWeightsRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.UntypedAPIFuture:
+        async def _operation() -> types.SaveWeightsResponse:
+            checkpoint = await state.save_checkpoint(
+                request.model_id,
+                user.user_id,
+                request.path,
+                "training",
+                seq_id=request.seq_id,
+            )
+            return types.SaveWeightsResponse(path=checkpoint.tinker_checkpoint.tinker_path)
+
+        return await _queue_future(
+            _operation,
+            state,
+            model_id=request.model_id,
+            user_id=user.user_id,
+            operation_type="save_weights",
+            operation_args={
+                "model_id": request.model_id,
+                "user_id": user.user_id,
+                "name": request.path,
+                "checkpoint_type": "training",
+            },
+        )
+
+    @app.post(
+        "/api/v1/save_weights_for_sampler",
+        response_model=types.UntypedAPIFuture,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def save_weights_for_sampler(
+        request: types.SaveWeightsForSamplerRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.UntypedAPIFuture:
+        async def _operation() -> types.SaveWeightsForSamplerResponseInternal:
+            # Two types input and output
+            # request.path is None and request.sampling_session_seq_id is not None:
+            #   - save checkpoint with unique name generated by save_checkpoint()
+            #   - return (path=None, sampling_session_id=created_sampling_session_id)
+            # request.path is not None and request.sampling_session_seq_id is None:
+            #   - save checkpoint with name specified by request.path
+            #   - return (path=request.path, sampling_session_id=None)
+            checkpoint = await state.save_checkpoint(
+                request.model_id,
+                user.user_id,
+                request.path,
+                "sampler",
+                seq_id=request.seq_id,
+            )
+
+            # If sampling_session_seq_id is provided, create a sampling session directly
+            # and return sampling_session_id (used by save_weights_and_get_sampling_client)
+            if request.sampling_session_seq_id is not None:
+                training_run = state.get_training_run_record(request.model_id, user.user_id)
+                sampling_session_id = await state.create_sampling_session(
+                    session_id=training_run.session_id,
+                    user_id=user.user_id,
+                    base_model=None,  # model_path takes priority
+                    model_path=checkpoint.tinker_checkpoint.tinker_path,
+                    session_seq_id=request.sampling_session_seq_id,
+                )
+                return types.SaveWeightsForSamplerResponseInternal(
+                    path=None,
+                    sampling_session_id=sampling_session_id,
+                )
+
+            # Otherwise, just return the path (used by save_weights_for_sampler)
+            return types.SaveWeightsForSamplerResponseInternal(
+                path=checkpoint.tinker_checkpoint.tinker_path,
+                sampling_session_id=None,
+            )
+
+        return await _queue_future(
+            _operation,
+            state,
+            model_id=request.model_id,
+            user_id=user.user_id,
+            operation_type="save_weights_for_sampler",
+            operation_args={
+                "model_id": request.model_id,
+                "user_id": user.user_id,
+                "name": request.path,
+                "checkpoint_type": "sampler",
+                "sampling_session_seq_id": request.sampling_session_seq_id,
+            },
+        )
+
+    @app.post(
+        "/api/v1/load_weights",
+        response_model=types.UntypedAPIFuture,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def load_weights(
+        request: types.LoadWeightsRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.UntypedAPIFuture:
+        async def _operation() -> types.LoadWeightsResponse:
+            await state.load_checkpoint(
+                model_id=request.model_id,
+                user_id=user.user_id,
+                path=request.path,
+                optimizer=request.optimizer,
+                seq_id=request.seq_id,
+            )
+            return types.LoadWeightsResponse(path=request.path)
+
+        return await _queue_future(
+            _operation,
+            state,
+            model_id=request.model_id,
+            user_id=user.user_id,
+            operation_type="load_weights",
+            operation_args={
+                "model_id": request.model_id,
+                "user_id": user.user_id,
+                "path": request.path,
+                "optimizer": request.optimizer,
+            },
+        )
+
+    @app.post(
+        "/api/v1/asample",
+        response_model=types.UntypedAPIFuture,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    async def asample(
+        request: types.SampleRequest,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.UntypedAPIFuture:
+        return await _queue_future(
+            partial(state.run_sample, request=request, user_id=user.user_id),
+            state=state,
+            user_id=user.user_id,
+            operation_type="sample",
+            operation_args={
+                "request": request,
+                "user_id": user.user_id,
+            },
+        )
+
+    @app.post("/api/v1/retrieve_future")
+    async def retrieve_future(
+        request: types.FutureRetrieveRequest,
+        raw_request: Request,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> Any:
+        try:
+            payload = await state.future_store.retrieve(
+                request_id=request.request_id, user_id=user.user_id
+            )
+        except LoopWeaveException as exc:
+            # A `ServerException` here means the future *operation itself*
+            # raised an unhandled exception (terminal business failure: e.g.
+            # vLLM EngineGenerateError, bad sampling params). These will never
+            # recover on retry, but ServerException defaults to status_code=500
+            # which makes tinker SDK enter an exponential-backoff retry loop
+            # against /retrieve_future, manifesting as a multi-minute hang.
+            # Map terminal failures to 422 (Unprocessable Entity) so the SDK
+            # surfaces the failure to the caller instead of retrying. Other
+            # LoopWeaveException subclasses (404 / 409 / 503 etc.) keep their
+            # original semantics.
+            if isinstance(exc, ServerException):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Future failed: {exc.detail}",
+                ) from exc
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=f"Failed to retrieve future: {exc.detail}",
+            ) from exc
+        except Exception as exc:  # pylint: disable=broad-except
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to retrieve future: {str(exc)}",
+            ) from exc
+
+        # Content negotiation: prefer protobuf for SampleResponse if client accepts it
+        from tinker.types.sample_response import SampleResponse as SampleResponseDataclass
+
+        accept_header = raw_request.headers.get("accept", "")
+        if (
+            isinstance(payload, SampleResponseDataclass)
+            and "application/x-protobuf" in accept_header
+        ):
+            proto_bytes = serialize_sample_response_proto(payload)
+            return Response(
+                content=proto_bytes,
+                media_type="application/x-protobuf",
+            )
+
+        return maybe_serialize_payload(payload)
+
+    @app.get(
+        "/api/v1/training_runs",
+        response_model=types.TrainingRunsResponse,
+    )
+    async def list_training_runs(
+        limit: int = Query(20, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.TrainingRunsResponse:
+        return state.list_training_runs(user_id=user.user_id, limit=limit, offset=offset)
+
+    @app.get(
+        "/api/v1/training_runs/{model_id}",
+        response_model=types.TrainingRun,
+    )
+    async def get_training_run(
+        model_id: str,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.TrainingRun:
+        return state.get_training_run_view(model_id=model_id, user_id=user.user_id)
+
+    def _build_checkpoint_cursor(total: int, limit: int, offset: int) -> types.Cursor:
+        return types.Cursor(offset=offset, limit=limit, total_count=total)
+
+    @app.get(
+        "/api/v1/training_runs/{model_id}/checkpoints",
+        response_model=types.CheckpointsListResponse,
+    )
+    async def list_training_run_checkpoints(
+        model_id: str,
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.CheckpointsListResponse:
+        checkpoints = state.list_checkpoints(model_id, user_id=user.user_id)
+        total = len(checkpoints)
+        start = min(offset, total)
+        end = min(start + limit, total)
+        subset = checkpoints[start:end]
+        cursor = _build_checkpoint_cursor(total, limit, offset)
+        return types.CheckpointsListResponse(checkpoints=subset, cursor=cursor)
+
+    @app.delete(
+        "/api/v1/training_runs/{model_id}/checkpoints/{checkpoint_path:path}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_checkpoint(
+        model_id: str,
+        checkpoint_path: str,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> None:
+        state.delete_checkpoint(model_id, user.user_id, _normalize_checkpoint_id(checkpoint_path))
+
+    @app.post(
+        "/api/v1/training_runs/{model_id}/checkpoints/{checkpoint_path:path}/publish",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def publish_checkpoint(
+        model_id: str,
+        checkpoint_path: str,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> None:
+        state.set_checkpoint_visibility(
+            model_id,
+            user.user_id,
+            _normalize_checkpoint_id(checkpoint_path),
+            public=True,
+        )
+
+    @app.delete(
+        "/api/v1/training_runs/{model_id}/checkpoints/{checkpoint_path:path}/publish",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def unpublish_checkpoint(
+        model_id: str,
+        checkpoint_path: str,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> None:
+        state.set_checkpoint_visibility(
+            model_id,
+            user.user_id,
+            _normalize_checkpoint_id(checkpoint_path),
+            public=False,
+        )
+
+    @app.get(
+        "/api/v1/training_runs/{model_id}/checkpoints/{checkpoint_path:path}/archive",
+        status_code=status.HTTP_302_FOUND,
+    )
+    async def checkpoint_archive(
+        model_id: str,
+        checkpoint_path: str,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> Response:
+        archive = state.build_archive_url(
+            model_id,
+            user_id=user.user_id,
+            checkpoint_id=_normalize_checkpoint_id(checkpoint_path),
+        )
+        expires = archive.expires.astimezone(timezone.utc)
+        return Response(
+            status_code=status.HTTP_302_FOUND,
+            headers={
+                "Location": archive.url,
+                "Expires": expires.strftime("%a, %d %b %Y %H:%M:%S GMT"),
+            },
+        )
+
+    @app.get(
+        "/api/v1/checkpoints",
+        response_model=types.CheckpointsListResponse,
+    )
+    async def list_user_checkpoints(
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.CheckpointsListResponse:
+        checkpoints = state.list_user_checkpoints(user.user_id)
+        total = len(checkpoints)
+        start = min(offset, total)
+        end = min(start + limit, total)
+        subset = checkpoints[start:end]
+        cursor = _build_checkpoint_cursor(total, limit, offset)
+        return types.CheckpointsListResponse(checkpoints=subset, cursor=cursor)
+
+    @app.post(
+        "/api/v1/weights_info",
+        response_model=types.WeightsInfoResponse,
+    )
+    async def weights_info(
+        body: WeightsInfoBody,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.WeightsInfoResponse:
+        return state.get_weights_info(body.tinker_path, user.user_id)
+
+    @app.get(
+        "/api/v1/sessions/{session_id}",
+        response_model=types.GetSessionResponse,
+    )
+    async def get_session(
+        session_id: str,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.GetSessionResponse:
+        return state.get_session_overview(session_id, user.user_id)
+
+    @app.get(
+        "/api/v1/sessions",
+        response_model=types.ListSessionsResponse,
+    )
+    async def list_sessions(
+        limit: int = Query(20, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.ListSessionsResponse:
+        return state.list_sessions(user_id=user.user_id, limit=limit, offset=offset)
+
+    @app.post(
+        "/api/v1/telemetry",
+        response_model=types.TelemetryResponse,
+    )
+    async def send_telemetry(
+        body: types.TelemetrySendRequest,
+    ) -> types.TelemetryResponse:
+        # We currently accept telemetry events for protocol compatibility but do not persist them.
+        return types.TelemetryResponse(status="accepted")
+
+    @app.get(
+        "/api/v1/samplers/{sampler_id}",
+        response_model=types.GetSamplerResponse,
+    )
+    async def get_sampler(
+        sampler_id: str,
+        state: ServerState = Depends(_get_state),
+        user: User = Depends(_get_user),
+    ) -> types.GetSamplerResponse:
+        return state.get_sampler_info(sampler_id, user.user_id)
+
+    @app.post(
+        "/api/v1/auth/token",
+        response_model=types.AuthTokenResponse,
+    )
+    async def auth_token(
+        user: User = Depends(_get_user),
+    ) -> types.AuthTokenResponse:
+        # LoopWeave uses API key auth directly; return a pass-through token
+        # that the SDK can use for subsequent requests.
+        import base64
+        import json
+        import time as _time
+
+        header = base64.urlsafe_b64encode(json.dumps({"alg": "none"}).encode()).decode().rstrip("=")
+        payload_data = {
+            "sub": user.user_id,
+            "exp": int(_time.time()) + 3600,
+        }
+        payload_b64 = (
+            base64.urlsafe_b64encode(json.dumps(payload_data).encode()).decode().rstrip("=")
+        )
+        token = f"{header}.{payload_b64}."
+        return types.AuthTokenResponse(jwt=token)
+
+    @app.post(
+        "/api/v1/client/config",
+        response_model=types.ClientConfigResponse,
+    )
+    async def client_config(
+        request: types.ClientConfigRequest,
+        user: User = Depends(_get_user),
+    ) -> types.ClientConfigResponse:
+        return types.ClientConfigResponse(
+            pjwt_auth_enabled=False,
+            credential_default_source="api_key",
+            sample_dispatch_bytes_semaphore_size=10 * 1024 * 1024,
+            inflight_response_bytes_semaphore_size=50 * 1024 * 1024,
+            parallel_fwdbwd_chunks=False,
+        )
+
+    for route in app.routes:
+        path = getattr(route, "path", None) or ""
+        # Skip healthz and OAI routes (OAI routes use their own auth via _get_user_oai)
+        if path == "/api/v1/healthz" or path.startswith("/oai/"):
+            continue
+        if hasattr(route, "dependencies"):
+            require_user_dependency(route)
+    return app

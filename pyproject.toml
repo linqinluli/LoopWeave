@@ -1,0 +1,156 @@
+[project]
+name = "loopweave"
+version = "0.1.8"
+description = "A multi-tenant fine-tuning platform for LLMs with Tinker-compatible API"
+authors = [
+    { name = "LoopWeave Authors" }
+]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.125.0",
+    "httpx>=0.28.1",
+    "numpy>=2.0.0",
+    "tinker>=0.18.2",
+    "protobuf>=4.21.0",
+    "typer>=0.20.1",
+    "uvicorn[standard]>=0.38.0",
+    "omegaconf>=2.3.0",
+    "ray>=2.50.0",
+    "transformers>=5.2.0,<6.0.0",
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-exporter-otlp>=1.20.0",
+    "opentelemetry-instrumentation-fastapi>=0.41b0",
+    "opentelemetry-instrumentation-logging>=0.41b0",
+    "psutil>=5.9.0",
+    "nvidia-ml-py>=13.0.0",
+    # Ray worker installs only main deps when packing; FSDP/verl + vLLM sampling need these
+    "torch>=2.0.0",
+    "peft>=0.18.0",
+    "tensordict>=0.5.0",
+    # Normal (registry-clean, publishable) metadata. The only released verl
+    # (0.8.0) hard-pins numpy<2.0.0, which conflicts with opencv (a vLLM dep,
+    # numpy>=2); verl #6551 (merged to main 2026-06-18) fixes this but is not yet
+    # released. We force the fixed commit via a uv override (see [tool.uv] below
+    # and scripts/verl-git-override.txt) rather than a direct URL here, so the
+    # published metadata stays clean and the <0.9 cap is honored.
+    "verl>=0.8.0,<0.9",
+    # Explicit vLLM cap matching trinity-rft 0.6's tested range (Qwen3.5 needs
+    # >=0.19.1; trinity caps <=0.23.0) so the published metadata is unambiguous.
+    "vllm>=0.19.1,<=0.23.0; sys_platform == 'linux'",
+    "trinity-rft[vllm]>=0.6.0; sys_platform == 'linux'",
+]
+
+[project.scripts]
+"loopweave" = "loopweave.cli:main"
+
+[project.optional-dependencies]
+
+dev = [
+    "detect-secrets>=1.5.0",
+    "nbqa>=1.9.1",
+    "pre-commit>=4.5.1",
+    "pyright>=1.1.408",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-json-ctrf",
+    "ruff>=0.14.14",
+]
+backend = [
+    "datasets>=4.0.0",
+    "huggingface-hub>=1.3.0,<2.0"
+]
+persistence = [
+    "redis>=5.0.0",
+]
+examples = [
+    "matplotlib>=3.8",
+]
+docs = [
+    "sphinx>=7.0.0,<9.0.0",
+    "myst-parser>=3.0.0",
+    "sphinx-copybutton",
+    "sphinx-design",
+    "linkify-it-py",
+    "sphinx-autobuild",
+    "sphinxawesome-theme>=6.0.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+    "tinker",
+    "thirdparty",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "I"]
+per-file-ignores = {"src/loopweave/server.py" = ["B008"]}
+
+[tool.ruff.lint.isort]
+known-first-party = ["loopweave"]
+known-third-party = ["tinker"]
+lines-after-imports = 2
+combine-as-imports = true
+split-on-trailing-comma = true
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+reportUnusedImport = false
+reportMissingImports = false
+reportPrivateImportUsage = false
+reportOptionalMemberAccess = false
+exclude = [
+    "**/.venv",
+    "**/__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    "tinker",
+    "thirdparty",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+addopts = "-q"
+asyncio_mode = "auto"
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+]
+
+[tool.nbqa.addopts]
+ruff = ["--fix"]
+
+[tool.nbqa.exclude]
+ruff = "^(\\.venv|tinker)/"
+
+[tool.uv]
+# Canonical rationale and removal procedure: scripts/verl-git-override.txt.
+# Force verl to the #6551 commit (numpy>=2 + vLLM/nccl runtime fixes). A normal
+# direct requirement can't satisfy verl>=0.8,<0.9 (the commit reports 0.9.0.dev0);
+# an override replaces the constraint. Covers project-mode installs (uv pip
+# install -e . / . / .[dev] / --local-source). install.sh and docker pass the
+# same pin via --override scripts/verl-git-override.txt for registry/git installs.
+# Once verl publishes a release containing #6551, remove this project override
+# and leave scripts/verl-git-override.txt present but comment-only so installed
+# wrappers refresh away the temporary pin.
+override-dependencies = [
+    "verl @ git+https://github.com/verl-project/verl.git@14574ecf52e310055e4d6e9f116bcb14d343d7e0",
+]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch", "numpy"]
+
+[build-system]
+requires = ["hatchling", "setuptools>=65", "wheel"]
+build-backend = "hatchling.build"
